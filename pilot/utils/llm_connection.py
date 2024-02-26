@@ -8,49 +8,52 @@ import tiktoken
 from prompt_toolkit.styles import Style
 
 from jsonschema import validate, ValidationError
-from utils.style import red
+from utils.style import color_red, color_yellow
 from typing import List
-from const.llm import MIN_TOKENS_FOR_GPT_RESPONSE, MAX_GPT_MODEL_TOKENS
+from const.llm import MAX_GPT_MODEL_TOKENS, API_CONNECT_TIMEOUT, API_READ_TIMEOUT
+from const.messages import AFFIRMATIVE_ANSWERS
 from logger.logger import logger, logging
-from helpers.exceptions import TokenLimitError, ApiKeyNotDefinedError
+from helpers.exceptions import TokenLimitError, ApiKeyNotDefinedError, ApiError
 from utils.utils import fix_json, get_prompt
 from utils.function_calling import add_function_calls_to_request, FunctionCallSet, FunctionType
 from utils.questionary import styled_text
 
+from .telemetry import telemetry
+
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
 
 def get_tokens_in_messages(messages: List[str]) -> int:
-    tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
     tokenized_messages = [tokenizer.encode(message['content']) for message in messages]
     return sum(len(tokens) for tokens in tokenized_messages)
 
 
+# TODO: not used anywhere
 def num_tokens_from_functions(functions):
     """Return the number of tokens used by a list of functions."""
-    encoding = tiktoken.get_encoding("cl100k_base")
-
     num_tokens = 0
     for function in functions:
-        function_tokens = len(encoding.encode(function['name']))
-        function_tokens += len(encoding.encode(function['description']))
+        function_tokens = len(tokenizer.encode(function['name']))
+        function_tokens += len(tokenizer.encode(function['description']))
 
         if 'parameters' in function:
             parameters = function['parameters']
             if 'properties' in parameters:
                 for propertiesKey in parameters['properties']:
-                    function_tokens += len(encoding.encode(propertiesKey))
+                    function_tokens += len(tokenizer.encode(propertiesKey))
                     v = parameters['properties'][propertiesKey]
                     for field in v:
                         if field == 'type':
                             function_tokens += 2
-                            function_tokens += len(encoding.encode(v['type']))
+                            function_tokens += len(tokenizer.encode(v['type']))
                         elif field == 'description':
                             function_tokens += 2
-                            function_tokens += len(encoding.encode(v['description']))
+                            function_tokens += len(tokenizer.encode(v['description']))
                         elif field == 'enum':
                             function_tokens -= 3
                             for o in v['enum']:
                                 function_tokens += 3
-                                function_tokens += len(encoding.encode(o))
+                                function_tokens += len(tokenizer.encode(o))
                 function_tokens += 11
 
         num_tokens += function_tokens
@@ -59,20 +62,48 @@ def num_tokens_from_functions(functions):
     return num_tokens
 
 
+def test_api_access(project) -> bool:
+    """
+    Test the API access by sending a request to the API.
+
+    :returns: True if the request was successful, False otherwise.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": "This is a connection test. If you can see this, please respond only with 'START' and nothing else."
+        }
+    ]
+
+    endpoint = os.getenv('ENDPOINT')
+    model = os.getenv('MODEL_NAME', 'gpt-4')
+    try:
+        response = create_gpt_chat_completion(messages, 'project_description', project)
+        if response is None or response == {}:
+            print(color_red("Error connecting to the API. Please check your API key/endpoint and try again."))
+            logger.error(f"The request to {endpoint} model {model} API failed.")
+            return False
+        return True
+    except Exception as err:
+        print(color_red("Error connecting to the API. Please check your API key/endpoint and try again."))
+        logger.error(f"The request to {endpoint} model {model} API failed: {err}", exc_info=err)
+        return False
+
+
 def create_gpt_chat_completion(messages: List[dict], req_type, project,
-                               function_calls: FunctionCallSet = None):
+                               function_calls: FunctionCallSet = None,
+                               prompt_data: dict = None,
+                               temperature: float = 0.7):
     """
     Called from:
       - AgentConvo.send_message() - these calls often have `function_calls`, usually from `pilot/const/function_calls.py`
          - convo.continuous_conversation()
-      - prompts.get_additional_info_from_openai()
-      - prompts.get_additional_info_from_user() after the user responds to each
-            "Please check this message and say what needs to be changed... {message}"
     :param messages: [{ "role": "system"|"assistant"|"user", "content": string }, ... ]
     :param req_type: 'project_description' etc. See common.STEPS
     :param project: project
     :param function_calls: (optional) {'definitions': [{ 'name': str }, ...]}
         see `IMPLEMENT_CHANGES` etc. in `pilot/const/function_calls.py`
+    :param prompt_data: (optional) { 'prompt': str, 'variables': { 'variable_name': 'variable_value', ... } }
     :return: {'text': new_code}
         or if `function_calls` param provided
              {'function_calls': {'name': str, arguments: {...}}}
@@ -81,7 +112,7 @@ def create_gpt_chat_completion(messages: List[dict], req_type, project,
     gpt_data = {
         'model': os.getenv('MODEL_NAME', 'gpt-4'),
         'n': 1,
-        'temperature': 1,
+        'temperature': temperature,
         'top_p': 1,
         'presence_penalty': 0,
         'frequency_penalty': 0,
@@ -97,19 +128,27 @@ def create_gpt_chat_completion(messages: List[dict], req_type, project,
                 del gpt_data[key]
 
     # Advise the LLM of the JSON response schema we are expecting
-    add_function_calls_to_request(gpt_data, function_calls)
+    messages_length = len(messages)
+    function_call_message = add_function_calls_to_request(gpt_data, function_calls)
+    if prompt_data is not None and function_call_message is not None:
+        prompt_data['function_call_message'] = function_call_message
 
     try:
         response = stream_gpt_completion(gpt_data, req_type, project)
+
+        # Remove JSON schema and any added retry messages
+        while len(messages) > messages_length:
+            messages.pop()
         return response
     except TokenLimitError as e:
         raise e
     except Exception as e:
         logger.error(f'The request to {os.getenv("ENDPOINT")} API failed: %s', e)
-        print(f'The request to {os.getenv("ENDPOINT")} API failed. Here is the error message:')
-        print(e)
-        return {}   # https://github.com/Pythagora-io/gpt-pilot/issues/130 - may need to revisit how we handle this
-
+        print(color_red(f'The request to {os.getenv("ENDPOINT")} API failed with error: {e}. Please try again later.'))
+        if isinstance(e, ApiError):
+            raise e
+        else:
+            raise ApiError(f"Error making LLM API request: {e}") from e
 
 def delete_last_n_lines(n):
     for _ in range(n):
@@ -136,11 +175,14 @@ def get_tokens_in_messages_from_openai_error(error_message):
     """
 
     match = re.search(r"your messages resulted in (\d+) tokens", error_message)
-
     if match:
         return int(match.group(1))
-    else:
-        return None
+
+    match = re.search(r"Requested (\d+). The input or output tokens must be reduced", error_message)
+    if match:
+        return int(match.group(1))
+
+    return None
 
 
 def retry_on_exception(func):
@@ -190,6 +232,7 @@ def retry_on_exception(func):
                     # or `Expecting value` with `pos` before the end of `e.doc`
                     function_error_count = update_error_count(args)
                     logger.warning('Received invalid character in JSON response from LLM. Asking to retry...')
+                    logger.info(f'  received: {e.doc}')
                     set_function_error(args, err_str)
                     if function_error_count < 3:
                         continue
@@ -203,29 +246,27 @@ def retry_on_exception(func):
                     # Attempt retry if the JSON schema is invalid, but avoid getting stuck in a loop
                     if function_error_count < 3:
                         continue
-                if "context_length_exceeded" in err_str:
+                if "context_length_exceeded" in err_str or "Request too large" in err_str:
                     # If the specific error "context_length_exceeded" is present, simply return without retry
                     # spinner_stop(spinner)
-                    raise TokenLimitError(get_tokens_in_messages_from_openai_error(err_str), MAX_GPT_MODEL_TOKENS)
+                    n_tokens = get_tokens_in_messages_from_openai_error(err_str)
+                    print(color_red(f"Error calling LLM API: The request exceeded the maximum token limit (request size: {n_tokens}) tokens."))
+                    trace_token_limit_error(n_tokens, args[0]['messages'], err_str)
+                    raise TokenLimitError(n_tokens, MAX_GPT_MODEL_TOKENS)
                 if "rate_limit_exceeded" in err_str:
-                    # Extracting the duration from the error string
-                    match = re.search(r"Please try again in (\d+)ms.", err_str)
-                    if match:
-                        # spinner = spinner_start(colored("Rate limited. Waiting...", 'yellow'))
-                        logger.debug('Rate limited. Waiting...')
-                        wait_duration = int(match.group(1)) / 1000
-                        time.sleep(wait_duration)
+                    rate_limit_exceeded_sleep(e, err_str)
                     continue
 
-                print(red(f'There was a problem with request to openai API:'))
+                print(color_red('There was a problem with request to openai API:'))
                 # spinner_stop(spinner)
                 print(err_str)
                 logger.error(f'There was a problem with request to openai API: {err_str}')
 
                 project = args[2]
+                print('yes/no', type='buttons-only')
                 user_message = styled_text(
                     project,
-                    "Do you want to try make the same request again? If yes, just press ENTER. Otherwise, type 'no'.",
+                    'Do you want to try make the same request again? If yes, just press ENTER. Otherwise, type "no".',
                     style=Style.from_dict({
                         'question': '#FF0000 bold',
                         'answer': '#FF910A bold'
@@ -234,10 +275,76 @@ def retry_on_exception(func):
 
                 # TODO: take user's input into consideration - send to LLM?
                 # https://github.com/Pythagora-io/gpt-pilot/issues/122
-                if user_message != '':
-                    return {}
+                if user_message.lower() not in AFFIRMATIVE_ANSWERS:
+                    if isinstance(e, ApiError):
+                        raise
+                    else:
+                        raise ApiError(f"Error making LLM API request: {err_str}") from e
 
     return wrapper
+
+
+def rate_limit_exceeded_sleep(e, err_str):
+    extra_buffer_time = float(os.getenv('RATE_LIMIT_EXTRA_BUFFER', 6))  # extra buffer time to wait, defaults to 6 secs
+    wait_duration_sec = extra_buffer_time  # Default time to wait in seconds
+
+    # Regular expression to find milliseconds
+    match = re.search(r'Please try again in (\d+)ms.', err_str)
+    if match:
+        milliseconds = int(match.group(1))
+        wait_duration_sec += milliseconds / 1000
+    else:
+        # Regular expression to find minutes and seconds
+        match = re.search(r'Please try again in (\d+)m(\d+\.\d+)s.', err_str)
+        if match:
+            minutes = int(match.group(1))
+            seconds = float(match.group(2))
+            wait_duration_sec += minutes * 60 + seconds
+        else:
+            # Check for only seconds
+            match = re.search(r'(\d+\.\d+)s.', err_str)
+            if match:
+                seconds = float(match.group(1))
+                wait_duration_sec += seconds
+
+    logger.debug(f'Rate limited. Waiting {wait_duration_sec} seconds...')
+
+    if isinstance(e, ApiError) and hasattr(e, "response_json") and e.response_json is not None and "error" in e.response_json:
+        message = e.response_json["error"]["message"]
+    else:
+        message = "Rate limited by the API (we're over 'tokens per minute' or 'requests per minute' limit)"
+    print(color_yellow(message))
+    print(color_yellow(f"Retrying in {wait_duration_sec} second(s)... with extra buffer of: {extra_buffer_time} second(s)"))
+    time.sleep(wait_duration_sec)
+
+
+def trace_token_limit_error(request_tokens: int, messages: list[dict], err_str: str):
+    # This must match files_list.prompt format in order to be able to count number of sent files
+    FILES_SECTION_PATTERN = r".*---START_OF_FILES---(.*)---END_OF_FILES---"
+    FILE_PATH_PATTERN = r"^\*\*(.*?)\*\*.*:$"
+
+    sent_files = set()
+    for msg in messages:
+        if not msg.get("content"):
+            continue
+        m = re.match(FILES_SECTION_PATTERN, msg["content"], re.DOTALL)
+        if not m:
+            continue
+        files_section = m.group(1)
+        msg_files = re.findall(FILE_PATH_PATTERN, files_section, re.MULTILINE)
+        sent_files.update(msg_files)
+
+    # Importing here to avoid circular import problem
+    from utils.exit import trace_code_event
+    trace_code_event(
+        "llm-request-token-limit-error",
+        {
+            "n_messages": len(messages),
+            "n_tokens": request_tokens,
+            "files": sorted(sent_files),
+            "error": err_str,
+        }
+    )
 
 
 @retry_on_exception
@@ -249,7 +356,6 @@ def stream_gpt_completion(data, req_type, project):
     :param project: NEEDED FOR WRAPPER FUNCTION retry_on_exception
     :return: {'text': str} or {'function_calls': {'name': str, arguments: '{...}'}}
     """
-
     # TODO add type dynamically - this isn't working when connected to the external process
     try:
         terminal_width = os.get_terminal_size().columns
@@ -281,7 +387,7 @@ def stream_gpt_completion(data, req_type, project):
             lines_printed += count_lines_based_on_width(buffer, terminal_width)
         logger.debug(f'lines printed: {lines_printed} - {terminal_width}')
 
-        delete_last_n_lines(lines_printed)
+        # delete_last_n_lines(lines_printed)  # TODO fix and test count_lines_based_on_width()
         return result_data
 
     # spinner = spinner_start(yellow("Waiting for OpenAI API response..."))
@@ -308,9 +414,10 @@ def stream_gpt_completion(data, req_type, project):
         headers = {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + get_api_key_or_throw('OPENROUTER_API_KEY'),
-            'HTTP-Referer': 'http://localhost:3000',
-            'X-Title': 'GPT Pilot (LOCAL)'
+            'HTTP-Referer': 'https://github.com/Pythagora-io/gpt-pilot',
+            'X-Title': 'GPT Pilot'
         }
+        data['max_tokens'] = MAX_GPT_MODEL_TOKENS
         data['model'] = model
     else:
         # If not, send the request to the OpenAI endpoint
@@ -321,19 +428,23 @@ def stream_gpt_completion(data, req_type, project):
         }
         data['model'] = model
 
+    telemetry.set("model", model)
+    token_count = get_tokens_in_messages(data['messages'])
+    request_start_time = time.time()
+
     response = requests.post(
         endpoint_url,
         headers=headers,
         json=data,
-        stream=True
+        stream=True,
+        timeout=(API_CONNECT_TIMEOUT, API_READ_TIMEOUT),
     )
 
-    # Log the response status code and message
-    logger.debug(f'Response status code: {response.status_code}')
-
     if response.status_code != 200:
-        logger.info(f'problem with request: {response.text}')
-        raise Exception(f"API responded with status code: {response.status_code}. Response text: {response.text}")
+        project.dot_pilot_gpt.log_chat_completion(endpoint, model, req_type, data['messages'], response.text)
+        logger.info(f'problem with request (status {response.status_code}): {response.text}')
+        telemetry.record_llm_request(token_count, time.time() - request_start_time, is_error=True)
+        raise ApiError(f"API responded with status code: {response.status_code}. Request token size: {token_count} tokens. Response text: {response.text}", response=response)
 
     # function_calls = {'name': '', 'arguments': ''}
 
@@ -357,6 +468,7 @@ def stream_gpt_completion(data, req_type, project):
 
                 if 'error' in json_line:
                     logger.error(f'Error in LLM response: {json_line}')
+                    telemetry.record_llm_request(token_count, time.time() - request_start_time, is_error=True)
                     raise ValueError(f'Error in LLM response: {json_line["error"]["message"]}')
 
                 choice = json_line['choices'][0]
@@ -389,8 +501,11 @@ def stream_gpt_completion(data, req_type, project):
                     # If you detect a natural breakpoint (e.g., line break or end of a response object), print & count:
                     if buffer.endswith('\n'):
                         if expecting_json and not received_json:
-                            received_json = assert_json_response(buffer, lines_printed > 2)
-
+                            try:
+                                received_json = assert_json_response(buffer, lines_printed > 2)
+                            except:
+                                telemetry.record_llm_request(token_count, time.time() - request_start_time, is_error=True)
+                                raise
                         # or some other condition that denotes a breakpoint
                         lines_printed += count_lines_based_on_width(buffer, terminal_width)
                         buffer = ""  # reset the buffer
@@ -400,15 +515,24 @@ def stream_gpt_completion(data, req_type, project):
 
     print('\n', type='stream')
 
+    telemetry.record_llm_request(
+        token_count + len(tokenizer.encode(gpt_response)),
+        time.time() - request_start_time,
+        is_error=False
+    )
+
     # if function_calls['arguments'] != '':
     #     logger.info(f'Response via function call: {function_calls["arguments"]}')
     #     function_calls['arguments'] = load_data_to_json(function_calls['arguments'])
     #     return return_result({'function_calls': function_calls}, lines_printed)
     logger.info('<<<<<<<<<< LLM Response <<<<<<<<<<\n%s\n<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<', gpt_response)
+    project.dot_pilot_gpt.log_chat_completion(endpoint, model, req_type, data['messages'], gpt_response)
 
     if expecting_json:
         gpt_response = clean_json_response(gpt_response)
         assert_json_schema(gpt_response, expecting_json)
+        # Note, we log JSON separately from the YAML log above incase the JSON is invalid and an error is raised
+        project.dot_pilot_gpt.log_chat_completion_json(endpoint, model, req_type, expecting_json, gpt_response)
 
     new_code = postprocessing(gpt_response, req_type)  # TODO add type dynamically
     return return_result({'text': new_code}, lines_printed)

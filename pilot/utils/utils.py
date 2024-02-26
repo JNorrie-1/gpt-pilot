@@ -8,8 +8,9 @@ import distro
 import json
 import hashlib
 import re
+import copy
 from jinja2 import Environment, FileSystemLoader
-from .style import green
+from .style import color_green
 
 from const.llm import MAX_QUESTIONS, END_RESPONSE
 from const.common import ROLES, STEPS
@@ -33,11 +34,10 @@ def capitalize_first_word_with_underscores(s):
     return capitalized_string
 
 
-def get_prompt(prompt_name, data=None):
-    if data is None:
-        data = {}
+def get_prompt(prompt_name, original_data=None):
+    data = copy.deepcopy(original_data) if original_data is not None else {}
 
-    data.update(get_prompt_components())
+    get_prompt_components(data)
 
     logger.info(f"Getting prompt for {prompt_name}")
 
@@ -50,15 +50,15 @@ def get_prompt(prompt_name, data=None):
     return output
 
 
-def get_prompt_components():
+def get_prompt_components(data):
     # This function reads and renders all prompts inside /prompts/components and returns them in dictionary
 
     # Create an empty dictionary to store the file contents.
     prompts_components = {}
-    data = {
+    data.update({
         'MAX_QUESTIONS': MAX_QUESTIONS,
         'END_RESPONSE': END_RESPONSE
-    }
+    })
 
     # Create a FileSystemLoader
     prompts_path = os.path.join(os.path.dirname(__file__), '..', 'prompts/components')
@@ -81,15 +81,15 @@ def get_prompt_components():
         # Store the file content in the dictionary
         prompts_components[file_key] = file_content
 
-    return prompts_components
+    return data.update(prompts_components)
 
 
-def get_sys_message(role):
+def get_sys_message(role,args=None):
     """
     :param role: 'product_owner', 'architect', 'dev_ops', 'tech_lead', 'full_stack_developer', 'code_monkey'
     :return: { "role": "system", "content": "You are a {role}... You do..." }
     """
-    content = get_prompt(f'system_messages/{role}.prompt')
+    content = get_prompt(f'system_messages/{role}.prompt',args)
 
     return {
         "role": "system",
@@ -116,7 +116,7 @@ def get_os_info():
     }
 
     if os_info["OS"] == "Linux":
-        os_info["Distribution"] = ' '.join(distro.linux_distribution(full_distribution_name=True))
+        os_info["Distribution"] = distro.name(pretty=True)
     elif os_info["OS"] == "Windows":
         os_info["Win32 Version"] = ' '.join(platform.win32_ver())
     elif os_info["OS"] == "Mac":
@@ -142,7 +142,7 @@ def step_already_finished(args, step):
     args.update(step['app_data'])
 
     message = f"✅  {capitalize_first_word_with_underscores(step['step'])}"
-    print(green(message))
+    print(color_green(message))
     logger.info(message)
 
 
@@ -203,3 +203,8 @@ def json_serial(obj):
         return str(obj)
     else:
         return str(obj)
+
+def remove_lines_with_string(file_content, matching_string):
+    lines = file_content.split('\n')
+    new_lines = [line for line in lines if matching_string not in line.lower()]
+    return '\n'.join(new_lines)
